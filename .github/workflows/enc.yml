@@ -1,0 +1,104 @@
+name: enc
+run-name: enc ${{ inputs.id || github.event.workflow_run.display_title }}
+on:
+  workflow_dispatch:
+    inputs:
+      id:
+        description: video id
+        required: true
+  workflow_run:
+    workflows: ["fetch"]
+    types: [completed]
+permissions:
+  contents: write
+concurrency:
+  group: enc-${{ inputs.id || github.event.workflow_run.display_title }}
+  cancel-in-progress: false
+jobs:
+  encrypt:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GH_TOKEN: ${{ github.token }}
+      IN_ID: ${{ inputs.id }}
+      TITLE: ${{ github.event.workflow_run.display_title }}
+      MIRROR_REPOS: ${{ secrets.MIRROR_REPOS }}
+      PIXELDRAIN_KEY: ${{ secrets.PIXELDRAIN_KEY }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: encrypt release assets (AES-256-CTR) and remove the plain files
+        shell: bash
+        run: |
+          set -euo pipefail
+          ID="${IN_ID:-}"
+          if [ -z "$ID" ]; then ID="${TITLE#fetch }"; fi
+          if ! printf '%s' "$ID" | grep -Eq '^[a-z0-9]+$'; then echo "skip: not a filmko id"; exit 0; fi
+          TAG="v-$ID"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then echo "skip: no release $TAG"; exit 0; fi
+          if gh release view "$TAG" --json assets -q '.assets[].name' | grep -qx "$ID.key"; then echo "already encrypted"; exit 0; fi
+
+          mkdir -p work
+          gh release download "$TAG" -D work -p "$ID-*.mp4" -p "$ID.mp4" --clobber || true
+          cd work
+          shopt -s nullglob
+          files=( *.mp4 )
+          if [ "${#files[@]}" -eq 0 ]; then echo "no plain files to encrypt"; exit 0; fi
+
+          K="$(openssl rand -hex 32)"
+          echo "::add-mask::$K"
+          hm() { python3 -c 'import hmac,hashlib,sys; print(hmac.new(bytes.fromhex(sys.argv[1]), sys.argv[2].encode(), hashlib.sha256).hexdigest())' "$K" "$1"; }
+
+          for f in "${files[@]}"; do
+            n="${f%.mp4}"
+            fk="$(hm "k|$n")"
+            iv="$(hm "i|$n" | cut -c1-32)"
+            openssl enc -aes-256-ctr -K "$fk" -iv "$iv" -in "$f" -out "$n.flk"
+            # تحقق كامل قبل أي مسح: الملف المشفّر لازم يتفك لنفس الأصل بالظبط
+            openssl enc -d -aes-256-ctr -K "$fk" -iv "$iv" -in "$n.flk" | cmp -s - "$f" || { echo "verify failed for $n"; exit 1; }
+            rm -f "$f"
+          done
+
+          printf '%s' "$K" | python3 -c 'import sys; sys.stdout.buffer.write(bytes.fromhex(sys.stdin.read()))' \
+            | openssl pkeyutl -encrypt -pubin -inkey "$GITHUB_WORKSPACE/flk-pub.pem" \
+                -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256 \
+            | base64 -w0 > "$ID.key"
+
+
+          # ---- مرايا: نفس الملفات المشفرة على أماكن تانية (فشل أي مرآة لا يوقف العملية) ----
+          echo '{}' > "$ID.mirrors.json"
+          PDAUTH=(); if [ -n "${PIXELDRAIN_KEY:-}" ]; then PDAUTH=(-u ":$PIXELDRAIN_KEY"); fi
+          for f in ./*.flk; do
+            n="$(basename "$f" .flk)"
+            urls=()
+            pd="$(curl -sf "${PDAUTH[@]}" --max-time 3000 -T "$f" "https://pixeldrain.com/api/file/$n.flk" 2>/dev/null | jq -r '.id // empty' 2>/dev/null || true)"
+            if [ -n "$pd" ]; then urls+=("https://pixeldrain.com/api/file/$pd"); fi
+            gp="$(curl -sf --max-time 3000 -F "file=@$f" https://upload.gofile.io/uploadfile 2>/dev/null | jq -r '.data.downloadPage // empty' 2>/dev/null || true)"
+            if [ -z "$gp" ]; then
+              gs="$(curl -sf --max-time 30 https://api.gofile.io/servers 2>/dev/null | jq -r '.data.servers[0].name // empty' 2>/dev/null || true)"
+              if [ -n "$gs" ]; then gp="$(curl -sf --max-time 3000 -F "file=@$f" "https://$gs.gofile.io/uploadFile" 2>/dev/null | jq -r '.data.downloadPage // empty' 2>/dev/null || true)"; fi
+            fi
+            if [ -n "$gp" ]; then jq --arg k "gofile_$n" --arg v "$gp" '.[$k]=[$v]' "$ID.mirrors.json" > t.json && mv t.json "$ID.mirrors.json"; fi
+            if [ -n "${MIRROR_REPOS:-}" ]; then
+              while IFS='=' read -r mr mt; do
+                if [ -z "$mr" ] || [ -z "$mt" ]; then continue; fi
+                if ( export GH_TOKEN="$mt"
+                     gh release view "$TAG" -R "$mr" >/dev/null 2>&1 || gh release create "$TAG" -R "$mr" -t "$TAG" -n "mirror" >/dev/null 2>&1
+                     gh release upload "$TAG" "$f" -R "$mr" --clobber >/dev/null 2>&1 ); then
+                  urls+=("https://github.com/$mr/releases/download/$TAG/$n.flk")
+                fi
+              done <<< "$MIRROR_REPOS"
+            fi
+            if [ "${#urls[@]}" -gt 0 ]; then
+              arr="$(printf '%s\n' "${urls[@]}" | jq -R . | jq -s .)"
+              jq --arg k "$n" --argjson v "$arr" '.[$k]=$v' "$ID.mirrors.json" > t.json && mv t.json "$ID.mirrors.json"
+            fi
+          done
+
+          gh release upload "$TAG" ./*.flk "./$ID.key" "./$ID.mirrors.json" --clobber
+
+          # بعد نجاح الرفع بس: امسح النسخ العادية من الإصدار
+          gh release view "$TAG" --json assets -q '.assets[].name' \
+            | { grep -E "^${ID}(-[0-9]+)?\.mp4$" || true; } \
+            | while read -r a; do gh release delete-asset "$TAG" "$a" -y; done
+          echo "done: $ID encrypted"
