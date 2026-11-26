@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: direct video link (http/https)
+        description: video link (direct file, page, .torrent or magnet)
         required: true
       id:
         description: video id
@@ -20,12 +20,13 @@ concurrency:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 340
     env:
       GH_TOKEN: ${{ github.token }}
       URL: ${{ inputs.url }}
       VID: ${{ inputs.id }}
-      TITLE: ${{ inputs.name }}
+      MIRROR_REPOS: ${{ secrets.MIRROR_REPOS }}
+      PIXELDRAIN_KEY: ${{ secrets.PIXELDRAIN_KEY }}
     steps:
       - uses: actions/checkout@v5
       - name: download and publish
@@ -33,20 +34,50 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s' "$VID" | grep -Eq '^[a-z0-9]+$' || { echo "bad id"; exit 1; }
-          case "$URL" in
-            https://*|http://*) ;;
-            *) echo "direct http(s) links only"; exit 1 ;;
-          esac
           TAG="v-$VID"
           if gh release view "$TAG" >/dev/null 2>&1; then echo "already published"; exit 0; fi
           mkdir -p work
-          curl -fL --retry 3 --retry-delay 5 --max-time 10000 -o "work/src.bin" "$URL"
-          SIZE="$(stat -c %s work/src.bin)"
-          if [ "$SIZE" -le 0 ]; then echo "empty download"; exit 1; fi
           sudo apt-get update -qq >/dev/null
-          sudo apt-get install -y -qq ffmpeg >/dev/null
-          H="$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 work/src.bin | head -n1 | tr -d '\r' || true)"
-          case "$H" in ''|*[!0-9]*) echo "not a video file: use a direct link to the file"; exit 1 ;; esac
+          sudo apt-get install -y -qq ffmpeg aria2 >/dev/null
+          SRC="work/src.bin"
+          vh() { ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$1" 2>/dev/null | head -n1 | tr -d '\r' || true; }
+
+          # 1) تورنت / magnet: ننزّل بـ aria2 ونختار أكبر ملف فيديو
+          get_torrent() {
+            local t="$1"
+            local TR="udp://tracker.opentrackr.org:1337/announce,udp://open.stealth.si:80/announce,udp://tracker.torrent.eu.org:451/announce,udp://exodus.desync.com:6969/announce"
+            mkdir -p work/dl
+            timeout 12000 aria2c --seed-time=0 --bt-tracker="$TR" --bt-stop-timeout=900 --file-allocation=none \
+              --max-connection-per-server=8 --summary-interval=60 -d work/dl "$t" || true
+            local best
+            best="$(find work/dl -type f \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.avi' -o -iname '*.mov' -o -iname '*.webm' -o -iname '*.ts' -o -iname '*.m4v' \) -printf '%s %p\n' | sort -rn | head -n1 | cut -d' ' -f2- || true)"
+            [ -n "$best" ] || return 1
+            mv "$best" "$SRC"
+          }
+
+          # 2) رابط مباشر لملف، وإلا نجرّب yt-dlp على الصفحة
+          get_http() {
+            curl -fL --retry 3 --retry-delay 5 --max-time 20000 -o "$SRC" "$URL" || true
+            if [ -s "$SRC" ] && [ -n "$(vh "$SRC")" ]; then return 0; fi
+            echo "not a direct video file, trying page extraction (yt-dlp)"
+            rm -f "$SRC"
+            pip install -q --user yt-dlp
+            "$HOME/.local/bin/yt-dlp" --no-playlist -f "bv*+ba/b" --merge-output-format mkv -o "work/page.%(ext)s" "$URL" || return 1
+            mv work/page.* "$SRC"
+          }
+
+          case "$URL" in
+            magnet:*) get_torrent "$URL" || { echo "torrent download failed (no seeds or no video file)"; exit 1; } ;;
+            http://*.torrent|https://*.torrent|http://*.torrent\?*|https://*.torrent\?*)
+              curl -fL --retry 3 -o work/in.torrent "$URL" || { echo "cannot fetch .torrent"; exit 1; }
+              get_torrent work/in.torrent || { echo "torrent download failed (no seeds or no video file)"; exit 1; } ;;
+            http://*|https://*) get_http || { echo "cannot get a video from this link"; exit 1; } ;;
+            *) echo "unsupported link"; exit 1 ;;
+          esac
+          [ -s "$SRC" ] || { echo "empty download"; exit 1; }
+          rm -rf work/dl
+          H="$(vh "$SRC")"
+          case "$H" in ''|*[!0-9]*) echo "not a video file"; exit 1 ;; esac
           echo "source height: $H"
           QS=""
           for q in 360 720 1080; do
@@ -62,8 +93,80 @@ jobs:
               ffmpeg -nostdin -loglevel error -y -i work/src.bin -vf "scale=-2:$q" -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -movflags +faststart "$out"
             fi
             S="$(stat -c %s "$out")"
-            if [ "$S" -gt 2147483648 ]; then echo "$q is larger than 2GB (GitHub release limit)"; rm -f "$out"; fi
+            if [ "$S" -gt 2000000000 ]; then
+              # أكبر من حد GitHub (2GB للملف): نعيد الترميز بمعدل بت محسوب عشان يدخل تحت الحد بدل ما نخسر الجودة
+              DUR="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$SRC" | head -n1 | cut -d. -f1)"
+              DUR="${DUR:-0}"
+              if [ "$DUR" -gt 0 ]; then
+                BR=$(( (1850000000 * 8 / DUR) - 160000 )); [ "$BR" -ge 300000 ] || BR=300000
+                echo "$q is $S bytes: re-encoding at ${BR} bps to fit 2GB"
+                ffmpeg -nostdin -loglevel error -y -i "$SRC" -vf "scale=-2:$q" -c:v libx264 -preset veryfast -b:v "$BR" -maxrate "$BR" -bufsize "$((BR*2))" -pix_fmt yuv420p -c:a aac -b:a 128k -movflags +faststart "$out"
+              fi
+              S="$(stat -c %s "$out")"
+              if [ "$S" -gt 2147483648 ]; then echo "$q still larger than 2GB, skipped"; rm -f "$out"; fi
+            fi
           done
           rm -f work/src.bin
           ls work/*.mp4 >/dev/null 2>&1 || { echo "no output produced"; exit 1; }
-          gh release create "$TAG" work/*.mp4 --title "${TITLE:-$VID}" --notes "filmko video"
+          if [ -f "$GITHUB_WORKSPACE/flk-pub.pem" ]; then
+            # التشفير مفعّل: نشفّر ونرفع المرايا هنا قبل إنشاء الإصدار، فالنسخة العادية عمرها ما بتتنشر على GitHub
+            ID="$VID"
+            cd work
+          shopt -s nullglob
+          files=( *.mp4 )
+          if [ "${#files[@]}" -eq 0 ]; then echo "no files to encrypt"; exit 1; fi
+
+          K="$(openssl rand -hex 32)"
+          echo "::add-mask::$K"
+          hm() { python3 -c 'import hmac,hashlib,sys; print(hmac.new(bytes.fromhex(sys.argv[1]), sys.argv[2].encode(), hashlib.sha256).hexdigest())' "$K" "$1"; }
+
+          for f in "${files[@]}"; do
+            n="${f%.mp4}"
+            fk="$(hm "k|$n")"
+            iv="$(hm "i|$n" | cut -c1-32)"
+            openssl enc -aes-256-ctr -K "$fk" -iv "$iv" -in "$f" -out "$n.flk"
+            # تحقق كامل قبل أي مسح: الملف المشفّر لازم يتفك لنفس الأصل بالظبط
+            openssl enc -d -aes-256-ctr -K "$fk" -iv "$iv" -in "$n.flk" | cmp -s - "$f" || { echo "verify failed for $n"; exit 1; }
+            rm -f "$f"
+          done
+
+          printf '%s' "$K" | python3 -c 'import sys; sys.stdout.buffer.write(bytes.fromhex(sys.stdin.read()))' \
+            | openssl pkeyutl -encrypt -pubin -inkey "$GITHUB_WORKSPACE/flk-pub.pem" \
+                -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256 \
+            | base64 -w0 > "$ID.key"
+
+
+          # ---- مرايا: نفس الملفات المشفرة على أماكن تانية (فشل أي مرآة لا يوقف العملية) ----
+          echo '{}' > "$ID.mirrors.json"
+          PDAUTH=(); if [ -n "${PIXELDRAIN_KEY:-}" ]; then PDAUTH=(-u ":$PIXELDRAIN_KEY"); fi
+          for f in ./*.flk; do
+            n="$(basename "$f" .flk)"
+            urls=()
+            pd="$(curl -sf "${PDAUTH[@]}" --max-time 3000 -T "$f" "https://pixeldrain.com/api/file/$n.flk" 2>/dev/null | jq -r '.id // empty' 2>/dev/null || true)"
+            if [ -n "$pd" ]; then urls+=("https://pixeldrain.com/api/file/$pd"); fi
+            gp="$(curl -sf --max-time 3000 -F "file=@$f" https://upload.gofile.io/uploadfile 2>/dev/null | jq -r '.data.downloadPage // empty' 2>/dev/null || true)"
+            if [ -z "$gp" ]; then
+              gs="$(curl -sf --max-time 30 https://api.gofile.io/servers 2>/dev/null | jq -r '.data.servers[0].name // empty' 2>/dev/null || true)"
+              if [ -n "$gs" ]; then gp="$(curl -sf --max-time 3000 -F "file=@$f" "https://$gs.gofile.io/uploadFile" 2>/dev/null | jq -r '.data.downloadPage // empty' 2>/dev/null || true)"; fi
+            fi
+            if [ -n "$gp" ]; then jq --arg k "gofile_$n" --arg v "$gp" '.[$k]=[$v]' "$ID.mirrors.json" > t.json && mv t.json "$ID.mirrors.json"; fi
+            if [ -n "${MIRROR_REPOS:-}" ]; then
+              while IFS='=' read -r mr mt; do
+                if [ -z "$mr" ] || [ -z "$mt" ]; then continue; fi
+                if ( export GH_TOKEN="$mt"
+                     gh release view "$TAG" -R "$mr" >/dev/null 2>&1 || gh release create "$TAG" -R "$mr" -t "$TAG" -n "mirror" >/dev/null 2>&1
+                     gh release upload "$TAG" "$f" -R "$mr" --clobber >/dev/null 2>&1 ); then
+                  urls+=("https://github.com/$mr/releases/download/$TAG/$n.flk")
+                fi
+              done <<< "$MIRROR_REPOS"
+            fi
+            if [ "${#urls[@]}" -gt 0 ]; then
+              arr="$(printf '%s\n' "${urls[@]}" | jq -R . | jq -s .)"
+              jq --arg k "$n" --argjson v "$arr" '.[$k]=$v' "$ID.mirrors.json" > t.json && mv t.json "$ID.mirrors.json"
+            fi
+          done
+
+            gh release create "$TAG" ./*.flk "./$ID.key" "./$ID.mirrors.json" --title "$VID" --notes "filmko video"
+          else
+            gh release create "$TAG" work/*.mp4 --title "$VID" --notes "filmko video"
+          fi
